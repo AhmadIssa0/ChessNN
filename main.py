@@ -135,7 +135,7 @@ if __name__ == '__main__':
 
     subset_indices = torch.randperm(len(train_dataset))[:25000]
     subset_dataset = Subset(train_dataset, subset_indices)
-    set_seed(48)
+    set_seed(49)
     eval_batch_size = 1024
     train_eval_dataloader = DataLoader(
         subset_dataset, batch_size=eval_batch_size, shuffle=True, num_workers=5,
@@ -157,7 +157,7 @@ if __name__ == '__main__':
     scaler = torch.cuda.amp.GradScaler()
     optim = Adam(transformer.parameters(), lr=0.0001)
 
-    global_step = 310500
+    global_step = 369500
     if True:
         checkpoint_path = f'checkpoint_{global_step}.pth'
         checkpoint = torch.load(checkpoint_path)
@@ -165,6 +165,9 @@ if __name__ == '__main__':
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
         optim.load_state_dict(checkpoint['optimizer_state_dict'])
         global_step = checkpoint['global_step']
+
+    for param_group in optim.param_groups:
+        param_group['lr'] = 0.00005
 
     summary_writer = SummaryWriter('runs/dModel_512_nlayers_8_nhead_8')
     l2_loss_fn = torch.nn.MSELoss(reduction='none')

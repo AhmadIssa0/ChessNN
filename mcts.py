@@ -23,7 +23,7 @@ class ChessState:
         return ChessState(new_board)
 
     def is_terminal(self):
-        return self.board.is_game_over()
+        return self.board.is_game_over(claim_draw=True)
 
     def is_win(self, player_color):
         # Check for a win condition for the specified player color.
@@ -45,11 +45,12 @@ class UCTNode:
         self.move: chess.Move = move
         self.parent: Optional[UCTNode] = parent
         self.state: ChessState = state
+        self.is_expanded = False
         self.children = []
-        self.total_value = 0
+        self.total_value = 0.0  # perspective of current player, positive means better
         self.visits = 0
         self.rollout_evaluator = rollout_evaluator
-        self.evals = None  # will store pairs of (move, eval) from NN from the perspective of current player
+        self.applied_virtual_loss_count = 0
 
     def add_child(self, child_node):
         self.children.append(child_node)
@@ -59,19 +60,14 @@ class UCTNode:
         self.total_value += result
 
     def uct_select_child(self):
-        # untried_moves = [move for move in self.state.get_moves() if move not in [child.move for child in self.children]]
-        # if untried_moves:
-        #     move = random.choice(untried_moves)
-        #     new_child = Node(move=move, parent=self, state=self.state.make_move(move), rollout_evaluator=self.rollout_evaluator)
-        #     self.add_child(new_child)
-        #     return new_child
+        assert self.is_expanded
 
         log_visits = math.log(self.visits)
         best_score = -float('inf')
         best_child = None
         for child in self.children:
             # A win for a child means that we're losing!
-            ucb1 = (1.0 - child.total_value) / (1.0 + child.visits) + 0.1 * math.sqrt(2 * log_visits / (1 + child.visits))
+            ucb1 = (1.0 - child.total_value / (1.0 + child.visits)) + 0.1 * math.sqrt(2 * log_visits / (1 + child.visits))
             if ucb1 > best_score:
                 best_score = ucb1
                 best_child = child
@@ -82,6 +78,7 @@ class UCTNode:
         while current is not None:
             current.total_value += 1.0
             current.visits += 1
+            current.applied_virtual_loss_count += 1
             current = current.parent
 
     def revert_virtual_loss(self):
@@ -89,35 +86,48 @@ class UCTNode:
         while current is not None:
             current.total_value -= 1.0
             current.visits -= 1
+            current.applied_virtual_loss_count -= 1
             current = current.parent
 
     def is_terminal(self):
         return self.state.is_terminal()
 
-    def expand(self):
-        legal_moves = self.state.board.legal_moves
-        evals = get_evals(self.state.board, legal_moves)
-        self.evals = list(zip(legal_moves, evals))
-        best_score = -float('inf')
-        best_child = None
-        for move, eval in self.evals:
+    def expand(self, move_list, child_evals) -> None:
+        # child_evals is from the perspective of white
+        self.is_expanded = True
+        for move, eval in zip(move_list, child_evals):
             next_state = self.state.make_move(move)
             child_node = UCTNode(move=move, parent=self, state=next_state, rollout_evaluator=self.rollout_evaluator)
-            child_node.total_value = 1.0 - eval
+            if next_state.board.turn == chess.WHITE:
+                child_node.total_value = eval
+            else:
+                child_node.total_value = 1.0 - eval
             self.add_child(child_node)
-            if best_score < eval:
-                best_score = eval
-                best_child = child_node
-
-        return best_child
 
     def rollout(self):
         return self.rollout_evaluator(self.state)
 
+    def terminal_state_eval(self):
+        # eval from perspective of current player
+        board: chess.Board = self.state.board
+        assert board.is_game_over(claim_draw=True)
+        if board.is_checkmate():  # current player got checkmated
+            return -9.0
+        return 0.5
+
+    def backup(self, result, result_from_white_perspective):
+        current = self
+        if result_from_white_perspective and self.state.board.turn != chess.WHITE:
+            result = 1.0 - result
+        while current is not None:
+            current.update(result)
+            current = current.parent
+            result = 1.0 - result
+
     def __str__(self, level=0):
         ret = "\t" * level
         if self.move is not None:
-            ret += f"Move: {self.move}, Eval: {self.total_value / self.visits}, Visits: {self.visits}, Player after move: {self.state.player}\n"
+            ret += f"Move: {self.move}, Eval: {self.total_value / (1 + self.visits)}, Visits: {self.visits}, Player after move: {self.state.player}, Virtual loss: {self.applied_virtual_loss_count}\n"
         else:
             ret += f"Root Node, Wins: {self.total_value}, Visits: {self.visits}\n"
 
@@ -127,27 +137,64 @@ class UCTNode:
         return ret
 
 
-def mcts(root, min_iterations, time_limit=2.0):
+def get_evals_for_all_moves(nodes, device='cuda'):
+    node_separations = []
+    i = 0
+    fens = []
+    node_moves = []
+    for node in nodes:
+        board: chess.Board = node.state.board
+        moves = []
+        for move in board.legal_moves:
+            moves.append(move)
+            board.push(move)
+            fens.append(board.fen())
+            board.pop()
+        node_moves.append(moves)
+        i += len(moves)
+        node_separations.append(i)
+    if node_separations:
+        node_separations = node_separations[:-1]
+    with torch.no_grad():
+        white_win_probs = transformer.compute_white_win_prob_from_fen(fens, device=device)
+        white_win_probs_split = [elt.detach().cpu().tolist()
+                                 for elt in torch.tensor_split(white_win_probs, node_separations)]
+    return node_moves, white_win_probs_split
+
+
+def mcts(root, node_batch_size, min_iterations, time_limit=2.0):
     start_time = time.time()
     i = 0
     while True:
+        # print('iteration', i)
         # Print progress every 100 iterations
         if i % 100 == 0:
             print('MCTS iteration:', i)
 
         # MCTS iteration process
-        node = root
-        while node.children:
-            node = node.uct_select_child()
-        if not node.is_terminal():
-            node = node.expand()
-        result = node.rollout()
+        nodes = []  # may have repeats
+        for _ in range(node_batch_size):
+            node = root
+            while node.children:
+                node = node.uct_select_child()
+            nodes.append(node)
+            node.add_virtual_loss()
+
+        nodes_set = set(nodes)
+        terminal_nodes = list(node for node in nodes_set if node.is_terminal())
+        non_terminal_nodes = list(node for node in nodes_set if not node.is_terminal())
+        # print(get_evals_for_all_moves(non_terminal_nodes))
+        for j, (moves, evals) in enumerate(zip(*get_evals_for_all_moves(non_terminal_nodes))):
+            node = non_terminal_nodes[j]
+            node.expand(moves, evals)
+            node.backup(result=max([1.0 - c.total_value for c in node.children]), result_from_white_perspective=False)
 
         # Update nodes with the result
-        while node is not None:
-            node.update(result)
-            node = node.parent
-            result = 1.0 - result
+        for node in terminal_nodes:
+            node.backup(result=node.terminal_state_eval(), result_from_white_perspective=False)
+
+        for node in nodes:
+            node.revert_virtual_loss()
 
         i += 1
 
@@ -164,11 +211,11 @@ def mcts(root, min_iterations, time_limit=2.0):
 
 def mcts_move(game, min_iterations=1000):
     root = UCTNode(state=game, rollout_evaluator=rollout_evaluator)
-    mcts(root, min_iterations=min_iterations)
+    mcts(root, node_batch_size=5, min_iterations=min_iterations)
     print(root)
     # Select the move with the highest number of visits
-    best_move = max(root.children, key=lambda c: (c.visits, 1.0 - c.total_value / c.visits))
-    return best_move.move, root.total_value / root.visits
+    best_move = max(root.children, key=lambda c: (c.visits, 1.0 - c.total_value / (1 + c.visits)))
+    return best_move.move, root.total_value / (1 + root.visits)
 
 
 def piece_value(piece):
@@ -238,20 +285,20 @@ def rollout_evaluator(chess_state):
 # fen = "3r2k1/3q1ppp/1p6/p2p4/1N2n3/4PQP1/5P1P/5RK1 w - - 0 30"
 board = chess.Board()
 state = ChessState(board)
-
 evals = [0.5]
 board.push(random.choice(list(board.legal_moves)))
 # evals = []
 plies = 0
+print(board)
 while not state.is_terminal() and plies < 200:
     plies += 1
-    min_iterations = 50 if plies < 100 else 200
+    min_iterations = 50
     # min_iterations = 2000
     move, eval = mcts_move(state, min_iterations=min_iterations)
     print('Making move:', move, 'eval:', round(eval, 3), 'ply:', plies)
     state = state.make_move(move)
     print(state.board)
-    if plies % 10 == 0:
+    if plies % 5 == 0:
         print(pgn.Game.from_board(state.board))
     if state.board.turn == chess.WHITE:  # eval is originally from black's perspective
         eval = 1.0 - eval
