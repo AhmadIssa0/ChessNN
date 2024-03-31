@@ -11,6 +11,8 @@ import os
 import random
 from torch.cuda.amp import autocast
 from tqdm import tqdm
+from bin_predictor import BinPredictor
+from functools import partial
 
 
 def remove_full_half_moves_from_fen(fen):
@@ -23,7 +25,7 @@ def remove_full_half_moves_from_fen(fen):
 
 class ChessTranformer(nn.Module):
 
-    def __init__(self, d_model=512, num_layers=8, nhead=8, dim_feedforward=2048):
+    def __init__(self, bin_predictor: BinPredictor, d_model=512, num_layers=8, nhead=8, dim_feedforward=2048):
         super(ChessTranformer, self).__init__()
         self.embedding = nn.Embedding(num_embeddings=len(FEN_CHAR_TO_INDEX), embedding_dim=d_model)
         self.proj_to_win_prob_logit = nn.Linear(d_model, 1)
@@ -36,7 +38,34 @@ class ChessTranformer(nn.Module):
         # Use a learned positional embedding
         self.pos_embedding = nn.Embedding(num_embeddings=MAX_FEN_LENGTH + 1, embedding_dim=d_model)
 
-    def compute_white_win_prob_from_fen(self, fen_list, device):
+        self.proj_to_bin_predictor_logits = nn.Linear(d_model, bin_predictor.total_num_bins)
+
+        self.cross_entropy_loss = torch.nn.CrossEntropyLoss(reduction='none')
+        self.bin_predictor = bin_predictor
+
+    def compute_cross_entropy_loss(self, emb_indices: torch.LongTensor, bin_pred_classes: torch.LongTensor):
+        logits = self.compute_bin_predictor_logits(emb_indices)
+        return self.cross_entropy_loss(logits, bin_pred_classes)  # (B)
+
+    def compute_bin_predictor_logits(self, emb_indices: torch.LongTensor):
+        embedding = self.embedding(emb_indices)  # (B, MAX_FEN_LENGTH + 1, d_model)
+        embedding = embedding + self.pos_embedding.weight.unsqueeze(0)
+        output = self.transformer(embedding)
+        # Only look at the first token's output (i.e. eval token)
+        return self.proj_to_bin_predictor_logits(self.layer_norm(output[:, 0, :]))  # (B, total_num_bins)
+
+    def compute_bin_probabilities(self, emb_indices: torch.LongTensor):
+        return self.compute_bin_predictor_logits(emb_indices).softmax(dim=1)
+
+    def compute_avg_bin_index(self, emb_indices: torch.LongTensor):
+        class_probs = self.compute_bin_probabilities(emb_indices)
+        class_indices = torch.arange(0, self.bin_predictor.total_num_bins, device=emb_indices.device).unsqueeze(0)
+        return (class_probs * class_indices).sum(dim=1)
+
+    def compute_avg_bin_index_from_fens(self, fen_list, device):
+        return self.compute_avg_bin_index(self.fen_list_to_emb_indices(fen_list, device))
+
+    def fen_list_to_emb_indices(self, fen_list, device) -> torch.LongTensor:
         emb_indices_batch = []
         for fen_str in fen_list:
             expanded_fen = remove_full_half_moves_from_fen(expand_fen_string(fen_str))
@@ -47,7 +76,10 @@ class ChessTranformer(nn.Module):
             emb_indices_batch.append(
                 torch.tensor(indices_lst, dtype=torch.long, device=device)
             )
-        emb_indices = torch.stack(emb_indices_batch, dim=0)
+        return torch.stack(emb_indices_batch, dim=0)
+
+    def compute_white_win_prob_from_fen(self, fen_list, device):
+        emb_indices = self.fen_list_to_emb_indices(fen_list, device)
         return self.compute_white_win_prob(emb_indices)
 
     def compute_white_win_prob(self, emb_indices: torch.LongTensor):
@@ -57,7 +89,7 @@ class ChessTranformer(nn.Module):
         return self.proj_to_win_prob_logit(self.layer_norm(output[:, 0, :])).squeeze(-1).sigmoid()
 
 
-def evaluate(transformer, dataloader, dataset_name, loss_fn, global_step, summary_writer):
+def evaluate_prob_of_win(transformer, dataloader, dataset_name, loss_fn, global_step, summary_writer):
     with torch.no_grad():
         total_test_samples = 0
         acc_loss = 0.0
@@ -82,6 +114,29 @@ def evaluate(transformer, dataloader, dataset_name, loss_fn, global_step, summar
         print('Valid?', test_batch.cp_valid[:10])
 
 
+def evaluate_cross_entropy(transformer, dataloader, dataset_name, global_step, summary_writer):
+    with torch.no_grad():
+        total_test_samples = 0
+        acc_loss = 0.0
+        for test_batch in dataloader:
+            test_batch = test_batch.to(device=device)
+            total_test_samples += len(test_batch.cp_valid)
+            acc_loss += transformer.compute_cross_entropy_loss(
+                emb_indices=test_batch.embedding_indices, bin_pred_classes=test_batch.bin_classes
+            ).sum().item()
+        loss = acc_loss / total_test_samples
+        print(
+            f'{dataset_name} loss: {loss}, Total samples: {total_test_samples}')
+        summary_writer.add_scalar(
+            f'CrossEntropyLoss/{dataset_name}',
+            loss,
+            global_step
+        )
+        # print('Pred_win_prob:', pred_white_win_prob[:10])
+        # print('True_win_prob:', test_batch.white_win_prob[:10])
+        # print('Valid?', test_batch.cp_valid[:10])
+
+
 def set_seed(seed):
     """
     Set the random seed for reproducibility.
@@ -95,33 +150,45 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False  # False for reproducibility, True may improve performance if inputs size does not vary.
 
 
-def skip_to_batch(dataloader, start_batch):
-    """
-    Create an iterator that skips to the specified start_batch, with progress
-    visualization using tqdm.
-
-    :param dataloader: An instance of DataLoader.
-    :param start_batch: The batch number to start from (0-indexed).
-    :return: An iterator positioned at the start_batch.
-    """
-    batch_iterator = iter(dataloader)
-    # Wrap the skipping loop with tqdm for progress visualization
-    for _ in tqdm(range(start_batch), desc="Skipping batches"):
-        next(batch_iterator)  # Skip batches until we reach start_batch
-    return batch_iterator
-
-
-if __name__ == '__main__':
+def train_to_predict_prob_of_win():
     device = 'cuda'
     # filepath = r'/mnt/c/Users/Ahmad-personal/Downloads/lichess_db_eval.jsonl'
     # filepath = r'C:/Users/Ahmad-personal/Downloads/lichess_db_eval.jsonl'
     # dataset = JSONLinesChessDataset(filepath)
 
+    # print(bin_pred.to_bin_index(10, 3))
+    # print(bin_pred.bin_index_to_description(43))
+
+
+
     filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-05.jsonl"
     dataset = JSONLinesLichessDataset(filepath)
     print('Dataset size:', len(dataset))
     print(dataset.__getitem__(11000))
-    # exit(0)
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    cp_evals = []
+    mates = []
+    for i in range(2000000):
+        raw_io = dataset.__getitem__(i)
+        cp_evals.append(raw_io.cp_eval)
+        if not raw_io.contains_eval:
+            mates.append(raw_io.mate)
+
+
+    plt.figure(figsize=(10, 6))
+    plt.hist(mates, bins=200, color='skyblue', alpha=0.7, rwidth=0.85)
+    plt.title('Stockfish mate in x, lichess dataset')
+    plt.xlabel('Number of moves to mate')
+    plt.ylabel('Frequency')
+    plt.savefig('mates.png')
+
+    import numpy as np
+    cp_evals_sorted = np.sort(cp_evals)
+    percentiles = np.percentile(cp_evals_sorted, 0.5 * np.arange(1, 201))
+    print(sorted(list(set(percentiles.tolist()))))
+    exit(0)
 
     set_seed(42)
 
@@ -137,6 +204,9 @@ if __name__ == '__main__':
     subset_dataset = Subset(train_dataset, subset_indices)
     set_seed(49)
     eval_batch_size = 1024
+    bin_pred = BinPredictor()
+    collate_fn = partial(collate_fn, bin_predictor=bin_pred)
+
     train_eval_dataloader = DataLoader(
         subset_dataset, batch_size=eval_batch_size, shuffle=True, num_workers=5,
         collate_fn=collate_fn, pin_memory=True, drop_last=False, prefetch_factor=2, persistent_workers=True
@@ -210,8 +280,171 @@ if __name__ == '__main__':
 
         if global_step % 1000 == 0:
             transformer.eval()
-            evaluate(transformer, test_dataloader, 'Test-Set', l2_loss_fn, global_step, summary_writer)
-            evaluate(transformer, train_eval_dataloader, 'Train-Eval-Set', l2_loss_fn, global_step, summary_writer)
+            evaluate_prob_of_win(transformer, test_dataloader, 'Test-Set', l2_loss_fn, global_step, summary_writer)
+            evaluate_prob_of_win(transformer, train_eval_dataloader, 'Train-Eval-Set', l2_loss_fn, global_step, summary_writer)
+            transformer.train()
+
+        if global_step % 500 == 0:
+            # Define the pattern for the checkpoint files
+            checkpoint_pattern = "checkpoint_*.pth"
+
+            # List all files matching the checkpoint pattern
+            existing_checkpoints = glob.glob(checkpoint_pattern)
+
+            # Delete all existing checkpoint files
+            for checkpoint_file in existing_checkpoints:
+                os.remove(checkpoint_file)
+                print(f'Deleted {checkpoint_file}')
+
+            # Save the new checkpoint
+            checkpoint_path = f'checkpoint_{global_step}.pth'
+
+            torch.save(
+                {
+                    'transformer_state_dict': transformer.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
+                    'optimizer_state_dict': optim.state_dict(),
+                    'global_step': global_step,
+                }, checkpoint_path)
+            print(f'Saved model at {checkpoint_path}.')
+
+
+def convert_checkpoint_to_bin_predictor():
+    d_model = 512
+    bin_pred = BinPredictor()
+    transformer = ChessTranformer(
+        bin_predictor=bin_pred, d_model=d_model, num_layers=8, nhead=8, dim_feedforward=4 * d_model
+    ).to(device=device)
+    scaler = torch.cuda.amp.GradScaler()
+    optim = Adam(transformer.parameters(), lr=0.0001)
+
+    global_step = 424000
+    if True:
+        checkpoint_path = f'checkpoint_424000_l2.pth'
+        checkpoint = torch.load(checkpoint_path)
+        transformer.load_state_dict(checkpoint['transformer_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        optim.load_state_dict(checkpoint['optimizer_state_dict'])
+        global_step = checkpoint['global_step']
+
+    transformer.proj_to_bin_predictor_logits = nn.Linear(d_model, bin_pred.total_num_bins)
+    torch.save(
+        {
+            'transformer_state_dict': transformer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'optimizer_state_dict': optim.state_dict(),
+            'global_step': global_step,
+        }, 'checkpoint_424000.pth'
+    )
+
+
+
+if __name__ == '__main__':
+    device = 'cuda'
+    # filepath = r'/mnt/c/Users/Ahmad-personal/Downloads/lichess_db_eval.jsonl'
+    # filepath = r'C:/Users/Ahmad-personal/Downloads/lichess_db_eval.jsonl'
+    # dataset = JSONLinesChessDataset(filepath)
+
+    # print(bin_pred.to_bin_index(10, 3))
+    # print(bin_pred.bin_index_to_description(43))
+
+    # filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-05.jsonl"
+    filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-06.jsonl"
+    dataset = JSONLinesLichessDataset(filepath)
+    print('Dataset size:', len(dataset))
+    print(dataset.__getitem__(11000))
+
+    set_seed(42)
+
+    # Calculate the sizes of each dataset
+    dataset_size = len(dataset)
+    test_size = 25000
+    train_size = dataset_size - test_size
+
+    # Create the train-test split
+    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+    subset_indices = torch.randperm(len(train_dataset))[:25000]
+    subset_dataset = Subset(train_dataset, subset_indices)
+    set_seed(1)
+    eval_batch_size = 512
+    bin_pred = BinPredictor()
+    collate_fn = partial(collate_fn, bin_predictor=bin_pred)
+
+    train_eval_dataloader = DataLoader(
+        subset_dataset, batch_size=eval_batch_size, shuffle=True, num_workers=5,
+        collate_fn=collate_fn, pin_memory=True, drop_last=False, prefetch_factor=2, persistent_workers=True
+    )
+
+    train_dataloader = DataLoader(
+        train_dataset, batch_size=512, shuffle=True, num_workers=5, collate_fn=collate_fn,
+        pin_memory=True, drop_last=True, prefetch_factor=2, persistent_workers=True
+    )
+
+    test_dataloader = DataLoader(
+        test_dataset, batch_size=eval_batch_size, shuffle=True, num_workers=5, collate_fn=collate_fn,
+        pin_memory=True, drop_last=False, prefetch_factor=2, persistent_workers=True
+    )
+
+    d_model = 512
+    transformer = ChessTranformer(
+        bin_predictor=bin_pred, d_model=d_model, num_layers=8, nhead=8, dim_feedforward=4*d_model
+    ).to(device=device)
+    scaler = torch.cuda.amp.GradScaler()
+    optim = Adam(transformer.parameters(), lr=0.0001)
+
+    global_step = 440000
+    if True:
+        checkpoint_path = f'checkpoint_{global_step}.pth'
+        checkpoint = torch.load(checkpoint_path)
+        transformer.load_state_dict(checkpoint['transformer_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        optim.load_state_dict(checkpoint['optimizer_state_dict'])
+        global_step = checkpoint['global_step']
+
+    for param_group in optim.param_groups:
+        param_group['lr'] = 0.0001
+
+    summary_writer = SummaryWriter('runs/dModel_512_nlayers_8_nhead_8_binPredictor')
+
+    # batch_iterator = skip_to_batch(train_dataloader, global_step)
+    for batch in train_dataloader:
+        global_step += 1
+        optim.zero_grad()
+        with autocast():
+            batch = batch.to(device=device)
+            loss = transformer.compute_cross_entropy_loss(
+                emb_indices=batch.embedding_indices, bin_pred_classes=batch.bin_classes
+            ).mean()
+
+        # Scales the loss, and calls backward() to create scaled gradients
+        scaler.scale(loss).backward()
+
+        max_norm = 0.3
+        scaler.unscale_(optim)  # Unscales the gradients of optimizer's assigned params in-place
+        grad_norm = torch.nn.utils.clip_grad_norm_(transformer.parameters(), max_norm)
+
+        # If gradients do not contain inf or NaN, updates the parameters
+        scaler.step(optim)
+        scaler.update()
+
+        if global_step % 100 == 0:
+            print('Global step:', global_step)
+            summary_writer.add_scalar(
+                f'CrossEntropyLoss/GradientNorm',
+                grad_norm,
+                global_step
+            )
+            summary_writer.add_scalar(
+                f'CrossEntropyLoss/TrainLoss',
+                loss,
+                global_step
+            )
+
+        if global_step % 1000 == 0:
+            transformer.eval()
+            evaluate_cross_entropy(transformer, test_dataloader, 'Test-Set', global_step, summary_writer)
+            evaluate_cross_entropy(transformer, train_eval_dataloader, 'Train-Eval-Set', global_step, summary_writer)
             transformer.train()
 
         if global_step % 500 == 0:

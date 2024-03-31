@@ -37,6 +37,18 @@ def process_game(game_pgn):
                     except ValueError:
                         continue  # Skip if eval_text is not a number or mate notation
                 results.append(data_dict)
+        elif board.is_stalemate() or board.is_insufficient_material():
+            fen = board.fen()
+            fen_no_counts = ' '.join(fen.split(' ')[:-2])
+            data_dict = {"FEN": fen, "FEN_processed": fen_no_counts, "cp": 0}
+            results.append(data_dict)
+        elif board.is_checkmate():
+            # if it's white's turn then black checkmated white, sloppy but give it same value as checkmate in 1
+            mate = -1 if board.turn == chess.WHITE else 1
+            fen = board.fen()
+            fen_no_counts = ' '.join(fen.split(' ')[:-2])
+            data_dict = {"FEN": fen, "FEN_processed": fen_no_counts, "mate": mate}
+            results.append(data_dict)
         else:
             break
     return results
@@ -151,8 +163,11 @@ def extract_fens_and_evals_to_jsonl(pgn_zst_path, output_path):
 
 
 if __name__ == '__main__':
+    # 2017-05 doesn't have stalemates, insufficient material draws, checkmates
+    # 2017-06 processed to include stalemates, insufficient material draws, checkmates
+    # (checkmates are included as mate in +/-1)
     extract_fens_and_evals_to_jsonl(
-        r"C:\Users\Ahmad-personal\Downloads\lichess_db_standard_rated_2017-05.pgn.zst",
-        r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-05.jsonl"
+        r"C:\Users\Ahmad-personal\Downloads\lichess_db_standard_rated_2017-06.pgn.zst",
+        r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-06.jsonl"
     )
 

@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass, field
 from typing import List
 import mmap
+from bin_predictor import BinPredictor
 
 
 FEN_CHAR_TO_INDEX = {
@@ -228,69 +229,13 @@ class JSONLinesLichessDataset(Dataset):
         self._map_file()
 
 
-# class JSONLinesChessDataset(Dataset):
-#     def __init__(self, file_path, index_file='index.pkl'):
-#         self.file_path = file_path
-#         self.index_file = index_file
-#
-#         if os.path.exists(self.index_file):
-#             self.offsets = self._load_index()
-#         else:
-#             self.offsets = self._build_index()
-#
-#     def _build_index(self):
-#         print('Creating dataset index file.')
-#         offsets = []
-#         with open(self.file_path, 'rb') as file:
-#             offset = 0
-#             for line in tqdm(file, desc="Indexing"):
-#                 offsets.append(offset)
-#                 offset += len(line)
-#         # Save the index to a file for future use
-#         with open(self.index_file, 'wb') as f:
-#             pickle.dump(offsets, f)
-#             print(f'Index file saved to: {self.index_file}')
-#         return offsets
-#
-#     def _load_index(self):
-#         # Load the index from a file
-#         with open(self.index_file, 'rb') as f:
-#             offsets = pickle.load(f)
-#         return offsets
-#
-#     def __len__(self):
-#         return len(self.offsets)
-#
-    # def __getitem__(self, idx):
-    #     with open(self.file_path, 'rb') as file:
-    #         file.seek(self.offsets[idx])
-    #         line = file.readline()
-    #         json_object = json.loads(line)
-    #
-    #         fen_str = json_object['fen']
-    #         expanded_fen_str = expand_fen_string(fen_str)
-    #         pv = json_object['evals'][0]['pvs'][0]
-    #         if 'cp' in pv:
-    #             centipawn_eval = pv['cp']
-    #             contains_eval = True
-    #         else:
-    #             centipawn_eval = 30 * 100 if pv['mate'] > 0 else -30 * 100
-    #             contains_eval = False
-    #
-    #     return RawIO(
-    #         expanded_fen=expanded_fen_str,
-    #         cp_eval=centipawn_eval,
-    #         contains_eval=contains_eval,
-    #         mate=pv.get('mate', 0),
-    #     )
-
-
 @dataclass
 class TransformerIO:
     embedding_indices: torch.IntTensor  # (B, Length of FEN + 1). We pad FEN strings to 85 characters
     cp_evals: torch.LongTensor  # (B)
     cp_valid: torch.BoolTensor  # (B), false if cp_eval was missing (because mate was found)
     expanded_fens: List[str]
+    bin_classes: torch.LongTensor  # Bin predictor class of (cp_evals, mate)
     white_win_prob: torch.Tensor = field(init=False)  # (B)
 
     def __post_init__(self):
@@ -298,18 +243,21 @@ class TransformerIO:
         # Win% = 50 + 50 * (2 / (1 + exp(-0.00368208 * centipawns)) - 1)
         self.white_win_prob = 1.0 / (1.0 + torch.exp(-0.00368208 * self.cp_evals))
 
+
     def to(self, device):
         return TransformerIO(
             embedding_indices=self.embedding_indices.to(device=device),
             cp_evals=self.cp_evals.to(device=device),
             cp_valid=self.cp_valid.to(device=device),
-            expanded_fens=self.expanded_fens
+            expanded_fens=self.expanded_fens,
+            bin_classes=self.bin_classes.to(device=device)
         )
 
 
-def collate_fn(batch: List[RawIO]) -> TransformerIO:
+def collate_fn(batch: List[RawIO], bin_predictor: BinPredictor) -> TransformerIO:
     """Batch is a list of dicts with key"""
     emb_indices_batch = []
+    bin_classes = []
     # Use a single token for the eval
     for batch_elt in batch:
         # print(batch_elt.expanded_fen)
@@ -323,6 +271,7 @@ def collate_fn(batch: List[RawIO]) -> TransformerIO:
         emb_indices_batch.append(
             torch.tensor(indices_lst, dtype=torch.long)
         )
+        bin_classes.append(bin_predictor.to_bin_index(batch_elt.cp_eval, batch_elt.mate))
 
     eval_batch = torch.tensor([x.cp_eval for x in batch], dtype=torch.long)
     cp_valid = torch.tensor([x.contains_eval for x in batch], dtype=torch.bool)
@@ -332,4 +281,5 @@ def collate_fn(batch: List[RawIO]) -> TransformerIO:
         cp_evals=eval_batch,
         cp_valid=cp_valid,
         expanded_fens=[x.expanded_fen for x in batch],
+        bin_classes=torch.tensor(bin_classes, dtype=torch.long)
     )
