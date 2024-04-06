@@ -57,10 +57,29 @@ class ChessTranformer(nn.Module):
     def compute_bin_probabilities(self, emb_indices: torch.LongTensor):
         return self.compute_bin_predictor_logits(emb_indices).softmax(dim=1)
 
+    def compute_bin_probabilities_from_fens(self, fen_list, device):
+        return self.compute_bin_probabilities(self.fen_list_to_emb_indices(fen_list, device))
+
     def compute_avg_bin_index(self, emb_indices: torch.LongTensor):
         class_probs = self.compute_bin_probabilities(emb_indices)
         class_indices = torch.arange(0, self.bin_predictor.total_num_bins, device=emb_indices.device).unsqueeze(0)
         return (class_probs * class_indices).sum(dim=1)
+
+    def compute_bin_index_means_and_stds_from_fens(self, fen_list, device):
+        probabilities = self.compute_bin_probabilities_from_fens(fen_list, device)
+        indices = torch.arange(0, self.bin_predictor.total_num_bins, device=device).unsqueeze(0)
+
+        mean_indices = torch.sum(indices * probabilities, dim=1)
+        squared_diffs = (indices - mean_indices.unsqueeze(1)) ** 2
+        variances = torch.sum(squared_diffs * probabilities, dim=1)
+        std_deviations = torch.sqrt(variances)
+        return mean_indices, std_deviations
+
+    # def forward(self, emb_indices: torch.LongTensor):
+    #     """Same as compute_avg_bin_index()"""
+    #     class_probs = self.compute_bin_probabilities(emb_indices)
+    #     class_indices = torch.arange(0, self.bin_predictor.total_num_bins, device=emb_indices.device).unsqueeze(0)
+    #     return (class_probs * class_indices).sum(dim=1)
 
     def compute_avg_bin_index_from_fens(self, fen_list, device):
         return self.compute_avg_bin_index(self.fen_list_to_emb_indices(fen_list, device))
@@ -366,7 +385,7 @@ if __name__ == '__main__':
 
     subset_indices = torch.randperm(len(train_dataset))[:25000]
     subset_dataset = Subset(train_dataset, subset_indices)
-    set_seed(1)
+    set_seed(7)
     eval_batch_size = 512
     bin_pred = BinPredictor()
     collate_fn = partial(collate_fn, bin_predictor=bin_pred)
@@ -393,7 +412,7 @@ if __name__ == '__main__':
     scaler = torch.cuda.amp.GradScaler()
     optim = Adam(transformer.parameters(), lr=0.0001)
 
-    global_step = 440000
+    global_step = 709500
     if True:
         checkpoint_path = f'checkpoint_{global_step}.pth'
         checkpoint = torch.load(checkpoint_path)

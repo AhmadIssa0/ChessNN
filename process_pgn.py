@@ -72,7 +72,7 @@ def extract_fens_and_evals_to_jsonl(pgn_zst_path, output_path):
                     games_batch.append(game_pgn)
                     game_pgn = ""  # Reset for the next game
                     if len(games_batch) >= batch_size:
-                        with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
+                        with multiprocessing.Pool(processes=multiprocessing.cpu_count()-2) as pool:
                             batch_results = pool.map(process_game, games_batch)
                         for game_results in batch_results:
                             for result in game_results:
@@ -89,7 +89,7 @@ def extract_fens_and_evals_to_jsonl(pgn_zst_path, output_path):
 
             # Process any remaining games in the last batch
             if games_batch:
-                with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
+                with multiprocessing.Pool(processes=multiprocessing.cpu_count()-2) as pool:
                     batch_results = pool.map(process_game, games_batch)
                 for game_results in batch_results:
                     for result in game_results:
@@ -167,7 +167,7 @@ if __name__ == '__main__':
     # 2017-06 processed to include stalemates, insufficient material draws, checkmates
     # (checkmates are included as mate in +/-1)
     extract_fens_and_evals_to_jsonl(
-        r"C:\Users\Ahmad-personal\Downloads\lichess_db_standard_rated_2017-06.pgn.zst",
-        r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-06.jsonl"
+        r"C:\Users\Ahmad-personal\Downloads\lichess_db_standard_rated_2017-07.pgn.zst",
+        r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-07.jsonl"
     )
 
