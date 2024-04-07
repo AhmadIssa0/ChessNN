@@ -10,6 +10,7 @@ import time
 from typing import Optional, List
 from bin_predictor import BinPredictor
 import os
+from torch.cuda.amp import autocast
 
 
 class ChessState:
@@ -69,7 +70,7 @@ class UCTNode:
         best_child = None
         for child in self.children:
             # A win for a child means that we're losing!
-            ucb1 = (1.0 - child.total_value / (1.0 + child.visits)) + self.init_eval_std * math.sqrt(2 * log_visits / (1 + child.visits))
+            ucb1 = (1.0 - child.total_value / (1.0 + child.visits)) + 0.05 * math.sqrt(2 * log_visits / (1 + child.visits))
             if ucb1 > best_score:
                 best_score = ucb1
                 best_child = child
@@ -105,9 +106,9 @@ class UCTNode:
             child_node = UCTNode(move=move, parent=self, state=next_state)
             child_node.init_eval_std = eval_std
             if next_state.board.turn == chess.WHITE:
-                child_node.total_value = eval
+                child_node.total_value = eval.item()
             else:
-                child_node.total_value = 1.0 - eval
+                child_node.total_value = 1.0 - eval.item()
             self.add_child(child_node)
 
     def terminal_state_eval(self):
@@ -153,11 +154,13 @@ class MCTSEngine:
         transformer.eval()
         transformer.transformer = torch.compile(transformer.transformer)
         self.transformer = transformer
+        self.calls_to_eval = 0
         # The first time we call the transformer it's slow, so let's do it now not in a game!
         self.mcts_move(ChessState(chess.Board()), time_limit=1.0, verbose=False)
         print(f'Loaded transformer from checkpoint: {checkpoint_path}.')
 
     def get_evals_for_all_moves(self, nodes: List[UCTNode]):
+        self.calls_to_eval += 1
         if len(nodes) == 0:
             return [], []
         node_separations = []
@@ -172,7 +175,7 @@ class MCTSEngine:
                 moves.append(move)
                 board.push(move)
                 fens.append(board.fen())
-                if board.can_claim_draw():
+                if board.is_repetition() or board.is_fifty_moves() or board.is_stalemate():
                     draw_indices.append(idx)
                 board.pop()
             node_moves.append(moves)
@@ -180,20 +183,44 @@ class MCTSEngine:
             node_separations.append(i)
         if node_separations:
             node_separations = node_separations[:-1]
-        with torch.no_grad():
-            # white_evals = transformer.compute_white_win_prob_from_fen(fens, device=device)
-            # white_evals = self.transformer.compute_avg_bin_index_from_fens(fens, device=self.device)
-            white_evals, white_eval_stds = self.transformer.compute_bin_index_means_and_stds_from_fens(
-                fens, device=self.device)
-            white_evals = white_evals / (self.transformer.bin_predictor.total_num_bins - 1.0)
-            white_eval_stds = white_eval_stds / (self.transformer.bin_predictor.total_num_bins - 1.0)
-            for idx in draw_indices:
-                white_evals[idx] = 0.5
-                white_eval_stds[idx] = 0.0
-            white_win_probs_split = [elt.detach().cpu().tolist()
-                                     for elt in torch.tensor_split(white_evals, node_separations)]
-            white_eval_stds_split = [elt.detach().cpu().tolist()
-                                     for elt in torch.tensor_split(white_eval_stds, node_separations)]
+
+        return self._compute_evals_from_fens(fens, node_separations, draw_indices, node_moves)
+
+        # with autocast():
+        #     with torch.no_grad():
+        #         # white_evals = transformer.compute_white_win_prob_from_fen(fens, device=device)
+        #         # white_evals = self.transformer.compute_avg_bin_index_from_fens(fens, device=self.device)
+        #         white_evals, white_eval_stds = self.transformer.compute_bin_index_means_and_stds_from_fens(
+        #             fens, device=self.device)
+        #         white_evals = white_evals / (self.transformer.bin_predictor.total_num_bins - 1.0)
+        #         white_eval_stds = white_eval_stds / (self.transformer.bin_predictor.total_num_bins - 1.0)
+        #         for idx in draw_indices:
+        #             white_evals[idx] = 0.5
+        #             white_eval_stds[idx] = 0.0
+        #         white_win_probs_split = [elt.detach().cpu().tolist()
+        #                                  for elt in torch.tensor_split(white_evals, node_separations)]
+        #         white_eval_stds_split = [elt.detach().cpu().tolist()
+        #                                  for elt in torch.tensor_split(white_eval_stds, node_separations)]
+        # return node_moves, white_win_probs_split, white_eval_stds_split
+
+    def _compute_evals_from_fens(self, fens, node_separations, draw_indices, node_moves):
+        with autocast():
+            with torch.no_grad():
+                # white_evals = transformer.compute_white_win_prob_from_fen(fens, device=device)
+                # white_evals = self.transformer.compute_avg_bin_index_from_fens(fens, device=self.device)
+                white_evals, white_eval_stds = self.transformer.compute_bin_index_means_and_stds_from_fens(
+                    fens, device=self.device)
+                white_evals = white_evals / (self.transformer.bin_predictor.total_num_bins - 1.0)
+                white_eval_stds = white_eval_stds / (self.transformer.bin_predictor.total_num_bins - 1.0)
+                for idx in draw_indices:
+                    white_evals[idx] = 0.5
+                    white_eval_stds[idx] = 0.0
+                white_win_probs_split = torch.tensor_split(white_evals, node_separations)
+                # white_win_probs_split = [elt.detach().cpu().tolist()
+                #                          for elt in torch.tensor_split(white_evals, node_separations)]
+                white_eval_stds_split = torch.tensor_split(white_eval_stds, node_separations)
+                # white_eval_stds_split = [elt.detach().cpu().tolist()
+                #                          for elt in torch.tensor_split(white_eval_stds, node_separations)]
         return node_moves, white_win_probs_split, white_eval_stds_split
 
     def mcts(self, root: UCTNode, node_batch_size, time_limit=2.0, verbose=True) -> None:
@@ -215,7 +242,7 @@ class MCTSEngine:
             # print(get_evals_for_all_moves(non_terminal_nodes))
             for j, (moves, evals, eval_stds) in enumerate(zip(*self.get_evals_for_all_moves(non_terminal_nodes))):
                 node = non_terminal_nodes[j]
-                node.expand(moves, evals, eval_stds)
+                node.expand(moves, evals.cpu(), eval_stds.cpu())
                 scores = [1.0 - c.total_value for c in node.children]
                 assert len(scores) > 0, 'Cant backup when there are no children nodes!'
                 node.backup(result=max(scores), result_from_white_perspective=False)
@@ -234,7 +261,7 @@ class MCTSEngine:
         if verbose:
             print(f"Completed {i} iterations in {elapsed_time:.2f} seconds.")
 
-    def mcts_move(self, game: ChessState, node_batch_size=5, time_limit=2.0, verbose=True, root=None):
+    def mcts_move(self, game: ChessState, node_batch_size=1, time_limit=2.0, verbose=True, root=None):
         """Continue's from root if specified, """
         root = UCTNode(state=game)
         self.mcts(root, node_batch_size=node_batch_size, time_limit=time_limit, verbose=verbose)
@@ -279,7 +306,7 @@ def run():
     # evals = []
     plies = 0
     print(board)
-    while not state.is_terminal() and plies < 10:
+    while not state.is_terminal() and plies < 5:
         plies += 1
         move, eval = engine.mcts_move(state, time_limit=3.0)
         print('Making move:', move, 'eval:', round(eval, 3), 'ply:', plies)
@@ -306,9 +333,11 @@ def run():
     pgn_string = game.accept(pgn.StringExporter(headers=True, variations=True, comments=True))
 
     print(pgn_string)
+    print('Calls:', engine.calls_to_eval)
+
 
 if __name__ == '__main__':
-    import cProfile
+    # import cProfile
     # cProfile.run('run()')
     run()
 

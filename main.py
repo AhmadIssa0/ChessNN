@@ -93,9 +93,9 @@ class ChessTranformer(nn.Module):
             # Pad to 85 characters
             indices_lst += [FEN_CHAR_TO_INDEX[' '] for _ in range(MAX_FEN_LENGTH - len(expanded_fen))]
             emb_indices_batch.append(
-                torch.tensor(indices_lst, dtype=torch.long, device=device)
+                torch.tensor(indices_lst, dtype=torch.long)
             )
-        return torch.stack(emb_indices_batch, dim=0)
+        return torch.stack(emb_indices_batch, dim=0).to(device=device)
 
     def compute_white_win_prob_from_fen(self, fen_list, device):
         emb_indices = self.fen_list_to_emb_indices(fen_list, device)
@@ -368,7 +368,7 @@ if __name__ == '__main__':
     # print(bin_pred.bin_index_to_description(43))
 
     # filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-05.jsonl"
-    filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-06.jsonl"
+    filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-07.jsonl"
     dataset = JSONLinesLichessDataset(filepath)
     print('Dataset size:', len(dataset))
     print(dataset.__getitem__(11000))
@@ -385,7 +385,7 @@ if __name__ == '__main__':
 
     subset_indices = torch.randperm(len(train_dataset))[:25000]
     subset_dataset = Subset(train_dataset, subset_indices)
-    set_seed(7)
+    set_seed(1)
     eval_batch_size = 512
     bin_pred = BinPredictor()
     collate_fn = partial(collate_fn, bin_predictor=bin_pred)
@@ -412,7 +412,7 @@ if __name__ == '__main__':
     scaler = torch.cuda.amp.GradScaler()
     optim = Adam(transformer.parameters(), lr=0.0001)
 
-    global_step = 709500
+    global_step = 751000
     if True:
         checkpoint_path = f'checkpoint_{global_step}.pth'
         checkpoint = torch.load(checkpoint_path)
