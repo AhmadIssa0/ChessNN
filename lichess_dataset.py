@@ -283,3 +283,102 @@ def collate_fn(batch: List[RawIO], bin_predictor: BinPredictor) -> TransformerIO
         expanded_fens=[x.expanded_fen for x in batch],
         bin_classes=torch.tensor(bin_classes, dtype=torch.long)
     )
+
+
+def fen_to_halfkp(expanded_fen):
+    # (2 colours) * (5 piece types) * (64 square of piece) * (64 square of same colour king)
+    # There are only 5 piece types cos king is not counted
+    # halfkp_idx = piece_square + (p_idx + king_square * 10) * 64
+
+    piece_sq = 0
+    white_indices = []
+    black_indices = []
+    wking_sq = -1
+    bking_sq = -1
+    piece_to_idx = {'P': 0, 'N': 1, 'B': 2, 'R': 3, 'Q': 4, 'p': 5, 'n': 6, 'b': 7, 'r': 8, 'q': 9}
+
+    for c in expanded_fen:
+        if piece_sq >= 64:
+            break
+        if c == '/':
+            continue
+        elif c == '.':
+            pass
+        elif c == 'k':
+            bking_sq = piece_sq
+        elif c == 'K':
+            wking_sq = piece_sq
+        elif c.isupper():
+            white_indices.append(
+                piece_sq + 64 * piece_to_idx[c]
+            )
+        elif c.islower():
+            black_indices.append(
+                piece_sq + 64 * piece_to_idx[c]
+            )
+        else:
+            raise ValueError(f'Unexpected character in fen string: {c}')
+        piece_sq += 1
+
+    assert wking_sq >= 0
+    assert bking_sq >= 0
+    white_indices = [v + 64 * 10 * wking_sq for v in white_indices]
+    black_indices = [v + 64 * 10 * bking_sq for v in black_indices]
+    return white_indices, black_indices
+
+
+@dataclass
+class NNUEIO:
+    halfkp_indices: torch.IntTensor  # (B, 2, 16). Padded with (10*64*64)'s
+    cp_evals: torch.LongTensor  # (B)
+    mates: torch.IntTensor
+    expanded_fens: List[str]
+    side_to_move: torch.Tensor  # 1 for white, 0 for black
+    white_win_prob: torch.Tensor = field(init=False)  # (B)
+
+    def __post_init__(self):
+        # For conversion of centipawns to win percentage see https://lichess.org/page/accuracy
+        # Win% = 50 + 50 * (2 / (1 + exp(-0.00368208 * centipawns)) - 1)
+        self.white_win_prob = 1.0 / (1.0 + torch.exp(-0.00368208 * self.cp_evals))
+
+    def to(self, device):
+        return NNUEIO(
+            halfkp_indices=self.halfkp_indices.to(device=device),
+            cp_evals=self.cp_evals.to(device=device),
+            mates=self.mates.to(device=device),
+            expanded_fens=self.expanded_fens,
+            side_to_move=self.side_to_move.to(device=device),
+        )
+
+
+def nnue_collate_fn(batch: List[RawIO]):
+    half_kps = []
+    side_to_move = []
+
+    for batch_elt in batch:
+        white_indices, black_indices = fen_to_halfkp(batch_elt.expanded_fen)
+        white_indices = white_indices + [10*64*64] * (16 - len(white_indices))
+        black_indices = black_indices + [10*64*64] * (16 - len(black_indices))
+        half_kps.append(
+            torch.stack([
+                torch.tensor(white_indices, dtype=torch.long),
+                torch.tensor(black_indices, dtype=torch.long)
+            ])
+        )
+        stm_char = batch_elt.expanded_fen.split(' ')[1]
+        assert stm_char in ['w', 'b']
+        if stm_char == 'w':
+            side_to_move.append(1)
+        else:
+            side_to_move.append(0)
+
+    eval_batch = torch.tensor([x.cp_eval for x in batch], dtype=torch.long)
+    mates = torch.tensor([x.mate for x in batch], dtype=torch.bool)
+    return NNUEIO(
+        halfkp_indices=torch.stack(half_kps),
+        cp_evals=eval_batch,
+        mates=mates,
+        expanded_fens=[x.expanded_fen for x in batch],
+        side_to_move=torch.tensor(side_to_move)
+    )
+

@@ -167,7 +167,8 @@ if __name__ == '__main__':
     # 2017-06 processed to include stalemates, insufficient material draws, checkmates
     # (checkmates are included as mate in +/-1)
     extract_fens_and_evals_to_jsonl(
-        r"C:\Users\Ahmad-personal\Downloads\lichess_db_standard_rated_2017-07.pgn.zst",
-        r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-07.jsonl"
+        # r"C:\Users\Ahmad-personal\Downloads\lichess_db_standard_rated_2024-03.pgn.zst",
+        r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2024-02.pgn.zst",
+        r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2024-02.jsonl",
     )
 

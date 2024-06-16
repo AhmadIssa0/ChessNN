@@ -25,12 +25,12 @@ def remove_full_half_moves_from_fen(fen):
 
 class ChessTranformer(nn.Module):
 
-    def __init__(self, bin_predictor: BinPredictor, d_model=512, num_layers=8, nhead=8, dim_feedforward=2048):
+    def __init__(self, bin_predictor: BinPredictor, d_model=512, num_layers=8, nhead=8, dim_feedforward=2048, norm_first=True):
         super(ChessTranformer, self).__init__()
         self.embedding = nn.Embedding(num_embeddings=len(FEN_CHAR_TO_INDEX), embedding_dim=d_model)
         self.proj_to_win_prob_logit = nn.Linear(d_model, 1)
         self.encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, batch_first=True, norm_first=True,
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, batch_first=True, norm_first=norm_first,
             activation="gelu")
         self.transformer = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
         self.layer_norm = nn.LayerNorm(d_model, elementwise_affine=False)
@@ -47,6 +47,11 @@ class ChessTranformer(nn.Module):
         logits = self.compute_bin_predictor_logits(emb_indices)
         return self.cross_entropy_loss(logits, bin_pred_classes)  # (B)
 
+    def compute_cross_entropy_loss_from_probs(
+            self, emb_indices: torch.LongTensor, bin_class_probs: torch.Tensor, temperature=1.0):
+        logits = self.compute_bin_predictor_logits(emb_indices)
+        return self.cross_entropy_loss(logits / temperature, bin_class_probs)  # (B)
+
     def compute_bin_predictor_logits(self, emb_indices: torch.LongTensor):
         embedding = self.embedding(emb_indices)  # (B, MAX_FEN_LENGTH + 1, d_model)
         embedding = embedding + self.pos_embedding.weight.unsqueeze(0)
@@ -54,11 +59,12 @@ class ChessTranformer(nn.Module):
         # Only look at the first token's output (i.e. eval token)
         return self.proj_to_bin_predictor_logits(self.layer_norm(output[:, 0, :]))  # (B, total_num_bins)
 
-    def compute_bin_probabilities(self, emb_indices: torch.LongTensor):
-        return self.compute_bin_predictor_logits(emb_indices).softmax(dim=1)
+    def compute_bin_probabilities(self, emb_indices: torch.LongTensor, temperature=1.0):
+        return (self.compute_bin_predictor_logits(emb_indices) / temperature).softmax(dim=1)
 
     def compute_bin_probabilities_from_fens(self, fen_list, device):
-        return self.compute_bin_probabilities(self.fen_list_to_emb_indices(fen_list, device))
+        # return self.compute_bin_probabilities(self.fen_list_to_emb_indices(fen_list, device))
+        return self.forward(self.fen_list_to_emb_indices(fen_list, device))
 
     def compute_avg_bin_index(self, emb_indices: torch.LongTensor):
         class_probs = self.compute_bin_probabilities(emb_indices)
@@ -74,6 +80,9 @@ class ChessTranformer(nn.Module):
         variances = torch.sum(squared_diffs * probabilities, dim=1)
         std_deviations = torch.sqrt(variances)
         return mean_indices, std_deviations
+
+    def forward(self, emb_indices: torch.LongTensor, temperature=1.0):
+        return (self.compute_bin_predictor_logits(emb_indices) / temperature).softmax(dim=1)
 
     # def forward(self, emb_indices: torch.LongTensor):
     #     """Same as compute_avg_bin_index()"""
@@ -178,36 +187,36 @@ def train_to_predict_prob_of_win():
     # print(bin_pred.to_bin_index(10, 3))
     # print(bin_pred.bin_index_to_description(43))
 
-
-
-    filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-05.jsonl"
+    filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2024-02.jsonl"
     dataset = JSONLinesLichessDataset(filepath)
     print('Dataset size:', len(dataset))
     print(dataset.__getitem__(11000))
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    cp_evals = []
-    mates = []
-    for i in range(2000000):
-        raw_io = dataset.__getitem__(i)
-        cp_evals.append(raw_io.cp_eval)
-        if not raw_io.contains_eval:
-            mates.append(raw_io.mate)
 
 
-    plt.figure(figsize=(10, 6))
-    plt.hist(mates, bins=200, color='skyblue', alpha=0.7, rwidth=0.85)
-    plt.title('Stockfish mate in x, lichess dataset')
-    plt.xlabel('Number of moves to mate')
-    plt.ylabel('Frequency')
-    plt.savefig('mates.png')
-
-    import numpy as np
-    cp_evals_sorted = np.sort(cp_evals)
-    percentiles = np.percentile(cp_evals_sorted, 0.5 * np.arange(1, 201))
-    print(sorted(list(set(percentiles.tolist()))))
-    exit(0)
+    # import matplotlib
+    # matplotlib.use('Agg')
+    # import matplotlib.pyplot as plt
+    # cp_evals = []
+    # mates = []
+    # for i in range(2000000):
+    #     raw_io = dataset.__getitem__(i)
+    #     cp_evals.append(raw_io.cp_eval)
+    #     if not raw_io.contains_eval:
+    #         mates.append(raw_io.mate)
+    #
+    #
+    # plt.figure(figsize=(10, 6))
+    # plt.hist(mates, bins=200, color='skyblue', alpha=0.7, rwidth=0.85)
+    # plt.title('Stockfish mate in x, lichess dataset')
+    # plt.xlabel('Number of moves to mate')
+    # plt.ylabel('Frequency')
+    # plt.savefig('mates.png')
+    #
+    # import numpy as np
+    # cp_evals_sorted = np.sort(cp_evals)
+    # percentiles = np.percentile(cp_evals_sorted, 0.5 * np.arange(1, 201))
+    # print(sorted(list(set(percentiles.tolist()))))
+    # exit(0)
 
     set_seed(42)
 
@@ -357,6 +366,35 @@ def convert_checkpoint_to_bin_predictor():
     )
 
 
+def load_teacher_model_from_checkpoint(device='cuda'):
+    d_model = 512
+    transformer = ChessTranformer(
+        bin_predictor=bin_pred, d_model=d_model, num_layers=8, nhead=8, dim_feedforward=4 * d_model
+    ).to(device=device)
+    # import glob
+    # checkpoint_path = glob.glob("checkpoint_*.pth")[0]
+    checkpoint_path = f'teacher_checkpoint_1244000.pth'
+    checkpoint = torch.load(checkpoint_path)
+    transformer.load_state_dict(checkpoint['transformer_state_dict'])
+    return transformer.eval()
+
+
+class WarmupScheduler:
+    def __init__(self, optimizer, warmup_steps, base_lr, final_lr):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.base_lr = base_lr
+        self.final_lr = final_lr
+        self.step_num = 0
+
+    def step(self):
+        self.step_num += 1
+        if self.step_num <= self.warmup_steps:
+            lr = self.base_lr + (self.final_lr - self.base_lr) * (self.step_num / self.warmup_steps)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+
+
 
 if __name__ == '__main__':
     device = 'cuda'
@@ -367,13 +405,13 @@ if __name__ == '__main__':
     # print(bin_pred.to_bin_index(10, 3))
     # print(bin_pred.bin_index_to_description(43))
 
-    # filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-05.jsonl"
-    filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-07.jsonl"
+    # filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2017-07.jsonl"
+    filepath = r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals\data\lichess_db_standard_rated_2024-02.jsonl"
     dataset = JSONLinesLichessDataset(filepath)
     print('Dataset size:', len(dataset))
     print(dataset.__getitem__(11000))
 
-    set_seed(42)
+    set_seed(43)
 
     # Calculate the sizes of each dataset
     dataset_size = len(dataset)
@@ -383,48 +421,57 @@ if __name__ == '__main__':
     # Create the train-test split
     train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
 
-    subset_indices = torch.randperm(len(train_dataset))[:25000]
+    subset_indices = torch.randperm(len(train_dataset))[:test_size]
     subset_dataset = Subset(train_dataset, subset_indices)
-    set_seed(1)
+    set_seed(17)
     eval_batch_size = 512
     bin_pred = BinPredictor()
     collate_fn = partial(collate_fn, bin_predictor=bin_pred)
 
     train_eval_dataloader = DataLoader(
-        subset_dataset, batch_size=eval_batch_size, shuffle=True, num_workers=5,
-        collate_fn=collate_fn, pin_memory=True, drop_last=False, prefetch_factor=2, persistent_workers=True
+        subset_dataset, batch_size=eval_batch_size, shuffle=True, num_workers=1,
+        collate_fn=collate_fn, pin_memory=True, drop_last=False, prefetch_factor=12, persistent_workers=True
     )
 
     train_dataloader = DataLoader(
-        train_dataset, batch_size=512, shuffle=True, num_workers=5, collate_fn=collate_fn,
-        pin_memory=True, drop_last=True, prefetch_factor=2, persistent_workers=True
+        train_dataset, batch_size=512, shuffle=True, num_workers=1, collate_fn=collate_fn,
+        pin_memory=True, drop_last=True, prefetch_factor=12, persistent_workers=True
     )
 
     test_dataloader = DataLoader(
-        test_dataset, batch_size=eval_batch_size, shuffle=True, num_workers=5, collate_fn=collate_fn,
-        pin_memory=True, drop_last=False, prefetch_factor=2, persistent_workers=True
+        test_dataset, batch_size=eval_batch_size, shuffle=True, num_workers=1, collate_fn=collate_fn,
+        pin_memory=True, drop_last=False, prefetch_factor=12, persistent_workers=True
     )
 
-    d_model = 512
+    d_model = 256
     transformer = ChessTranformer(
-        bin_predictor=bin_pred, d_model=d_model, num_layers=8, nhead=8, dim_feedforward=4*d_model
+        bin_predictor=bin_pred, d_model=d_model, num_layers=4, nhead=4, dim_feedforward=4*d_model, norm_first=False
     ).to(device=device)
     scaler = torch.cuda.amp.GradScaler()
-    optim = Adam(transformer.parameters(), lr=0.0001)
+    optim = Adam(transformer.parameters(), lr=0.0003)
 
-    global_step = 751000
+    # print(transformer.load_state_dict(torch.load(f'512 checkpoint_1244000.pth')['transformer_state_dict'], strict=False))
+
+    global_step = 0
     if True:
-        checkpoint_path = f'checkpoint_{global_step}.pth'
+        import glob
+        checkpoint_path = glob.glob("checkpoint_*.pth")[0]
+        # checkpoint_path = f'checkpoint_{global_step}.pth'
         checkpoint = torch.load(checkpoint_path)
         transformer.load_state_dict(checkpoint['transformer_state_dict'])
         scaler.load_state_dict(checkpoint['scaler_state_dict'])
         optim.load_state_dict(checkpoint['optimizer_state_dict'])
         global_step = checkpoint['global_step']
 
-    for param_group in optim.param_groups:
-        param_group['lr'] = 0.0001
+    # for param_group in optim.param_groups:
+    #     param_group['lr'] = 0.001
 
-    summary_writer = SummaryWriter('runs/dModel_512_nlayers_8_nhead_8_binPredictor')
+    # scheduler = WarmupScheduler(optim, warmup_steps=1000, base_lr=0.00001, final_lr=0.0003)
+
+    summary_writer = SummaryWriter('runs/dModel_256_nlayers_4_nhead_4_student3')
+
+    teacher = load_teacher_model_from_checkpoint()
+    temp = 4.0
 
     # batch_iterator = skip_to_batch(train_dataloader, global_step)
     for batch in train_dataloader:
@@ -432,9 +479,14 @@ if __name__ == '__main__':
         optim.zero_grad()
         with autocast():
             batch = batch.to(device=device)
-            loss = transformer.compute_cross_entropy_loss(
-                emb_indices=batch.embedding_indices, bin_pred_classes=batch.bin_classes
-            ).mean()
+            # loss = transformer.compute_cross_entropy_loss(
+            #     emb_indices=batch.embedding_indices, bin_pred_classes=batch.bin_classes
+            # ).mean()
+            logits = transformer.compute_bin_predictor_logits(emb_indices=batch.embedding_indices)
+            loss = transformer.cross_entropy_loss(logits, batch.bin_classes).mean() / 2 * 0.3
+            with torch.no_grad():
+                teacher_probs = teacher.compute_bin_probabilities(emb_indices=batch.embedding_indices, temperature=temp)
+            loss += (temp ** 2) * transformer.cross_entropy_loss(logits / temp, teacher_probs).mean() / 2 * 0.7
 
         # Scales the loss, and calls backward() to create scaled gradients
         scaler.scale(loss).backward()
@@ -446,6 +498,7 @@ if __name__ == '__main__':
         # If gradients do not contain inf or NaN, updates the parameters
         scaler.step(optim)
         scaler.update()
+        # scheduler.step()
 
         if global_step % 100 == 0:
             print('Global step:', global_step)
@@ -460,7 +513,7 @@ if __name__ == '__main__':
                 global_step
             )
 
-        if global_step % 1000 == 0:
+        if global_step % 2000 == 0:
             transformer.eval()
             evaluate_cross_entropy(transformer, test_dataloader, 'Test-Set', global_step, summary_writer)
             evaluate_cross_entropy(transformer, train_eval_dataloader, 'Train-Eval-Set', global_step, summary_writer)
