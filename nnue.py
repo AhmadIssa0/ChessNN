@@ -39,12 +39,22 @@ class NNUE(nn.Module):
                        (1 - side_to_move) * torch.concat([b_features, w_features], 1))
         hidden1 = self.layer1(torch.clamp(accumulator, 0.0, 1.0))
         hidden2 = self.layer2(torch.clamp(hidden1, 0.0, 1.0))
-        return self.layer3(hidden2).squeeze(-1)
+        side_to_move = side_to_move.squeeze(1)
+
+        # layer3 outputs values so that positive means good for side to move.
+        # but we want to deal with things so that positive means good for white
+        return (side_to_move - 0.5) * 2.0 * self.layer3(torch.clamp(hidden2, 0.0, 1.0)).squeeze(-1)
+        # return self.layer3(hidden2).squeeze(-1)
 
     def compute_white_win_prob(self, wb_emb_indices, side_to_move):
         output = self.forward(wb_emb_indices, side_to_move)
         scale = 0.00368208
         return (scale * output).sigmoid()
+
+    @staticmethod
+    def logit_to_white_win_prob(logits):
+        scale = 0.00368208
+        return (scale * logits).sigmoid()
 
     @staticmethod
     def fen_to_indices_stm(expanded_fen, device):
@@ -74,6 +84,9 @@ class NNUE(nn.Module):
     def forward_from_fens(self, fens, device):
         return self.forward(*self.fens_to_indices_stm(fens, device))
 
+    def compute_white_win_prob_from_fen(self, fens, device):
+        return NNUE.logit_to_white_win_prob(self.forward_from_fens(fens, device))
+
     def forward_from_fen(self, expanded_fen, device):
         return self.forward(*self.fen_to_indices_stm(expanded_fen, device))
 
@@ -86,7 +99,7 @@ def evaluate_prob_of_win(nnue, dataloader, dataset_name, loss_fn, global_step, s
             test_batch = test_batch.to(device=device)
             pred_white_win_prob = nnue.compute_white_win_prob(test_batch.halfkp_indices, side_to_move=test_batch.side_to_move)
             total_test_samples += len(test_batch.mates)
-            acc_loss += loss_fn(pred_white_win_prob, test_batch.white_win_prob).sum().item()
+            acc_loss += loss_fn(pred_white_win_prob, test_batch.white_win_prob_with_mates).sum().item()
         loss = acc_loss / total_test_samples
         print(
             f'{dataset_name} loss: {loss}, Total samples: {total_test_samples}')
@@ -96,7 +109,8 @@ def evaluate_prob_of_win(nnue, dataloader, dataset_name, loss_fn, global_step, s
             global_step
         )
         print('Pred_win_prob:', pred_white_win_prob[:10])
-        print('True_win_prob:', test_batch.white_win_prob[:10])
+        print('True_win_prob:', test_batch.white_win_prob_with_mates[:10])
+        print('Mates:', test_batch.mates[:10])
 
 
 # Function to save model weights as float32 in binary
@@ -142,7 +156,7 @@ def train_to_predict_prob_of_win():
 
     subset_indices = torch.randperm(len(train_dataset))[:25000]
     subset_dataset = Subset(train_dataset, subset_indices)
-    set_seed(50)
+    set_seed(60)
     eval_batch_size = 1024
 
     train_eval_dataloader = DataLoader(
@@ -151,7 +165,7 @@ def train_to_predict_prob_of_win():
     )
 
     train_dataloader = DataLoader(
-        train_dataset, batch_size=512, shuffle=True, num_workers=1, collate_fn=nnue_collate_fn,
+        train_dataset, batch_size=1024, shuffle=True, num_workers=1, collate_fn=nnue_collate_fn,
         pin_memory=True, drop_last=True, prefetch_factor=2, persistent_workers=False
     )
 
@@ -160,12 +174,12 @@ def train_to_predict_prob_of_win():
         pin_memory=True, drop_last=False, prefetch_factor=2, persistent_workers=False
     )
 
-    nnue = NNUE(embedding_dim=1024, num_hidden1=8, num_hidden2=32).to(device=device)
+    nnue = NNUE(embedding_dim=2048, num_hidden1=16, num_hidden2=256).to(device=device)
     scaler = torch.cuda.amp.GradScaler()
     optim = Adam(nnue.parameters(), lr=0.001)
 
-    global_step = 0
-    if False:
+    global_step = 77500
+    if True:
         checkpoint_path = f'checkpoint_{global_step}.pth'
         checkpoint = torch.load(checkpoint_path)
         nnue.load_state_dict(checkpoint['nnue_state_dict'])
@@ -173,10 +187,10 @@ def train_to_predict_prob_of_win():
         optim.load_state_dict(checkpoint['optimizer_state_dict'])
         global_step = checkpoint['global_step']
 
-    # for param_group in optim.param_groups:
-    #     param_group['lr'] = 0.0003
+    for param_group in optim.param_groups:
+        param_group['lr'] = 0.001
 
-    summary_writer = SummaryWriter('runs/nnue_3')
+    summary_writer = SummaryWriter('runs/nnue_8_big_2048_16_256')
     l2_loss_fn = torch.nn.MSELoss(reduction='none')
 
     # batch_iterator = skip_to_batch(train_dataloader, global_step)
@@ -188,12 +202,12 @@ def train_to_predict_prob_of_win():
 
             pred_white_win_prob = nnue.compute_white_win_prob(batch.halfkp_indices, side_to_move=batch.side_to_move)
             # acc_loss += ((pred_evals - test_batch.cp_evals / 100.0) ** 2)[test_batch.cp_valid].sum().item()
-            loss = l2_loss_fn(pred_white_win_prob, batch.white_win_prob).mean()
+            loss = l2_loss_fn(pred_white_win_prob, batch.white_win_prob_with_mates).mean()
 
         # Scales the loss, and calls backward() to create scaled gradients
         scaler.scale(loss).backward()
 
-        max_norm = 0.3
+        max_norm = 0.15
         scaler.unscale_(optim)  # Unscales the gradients of optimizer's assigned params in-place
         grad_norm = torch.nn.utils.clip_grad_norm_(nnue.parameters(), max_norm)
 
@@ -201,7 +215,7 @@ def train_to_predict_prob_of_win():
         scaler.step(optim)
         scaler.update()
 
-        if global_step % 100 == 0:
+        if global_step % 200 == 0:
             print('Global step:', global_step)
             summary_writer.add_scalar(
                 f'Loss/GradientNorm',
@@ -227,11 +241,6 @@ def train_to_predict_prob_of_win():
             # List all files matching the checkpoint pattern
             existing_checkpoints = glob.glob(checkpoint_pattern)
 
-            # Delete all existing checkpoint files
-            for checkpoint_file in existing_checkpoints:
-                os.remove(checkpoint_file)
-                print(f'Deleted {checkpoint_file}')
-
             # Save the new checkpoint
             checkpoint_path = f'checkpoint_{global_step}.pth'
 
@@ -243,6 +252,11 @@ def train_to_predict_prob_of_win():
                     'global_step': global_step,
                 }, checkpoint_path)
             print(f'Saved model at {checkpoint_path}.')
+
+            # Delete all existing checkpoint files
+            for checkpoint_file in existing_checkpoints:
+                os.remove(checkpoint_file)
+                print(f'Deleted {checkpoint_file}')
 
 
 if __name__ == '__main__':

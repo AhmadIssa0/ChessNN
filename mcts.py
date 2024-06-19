@@ -20,6 +20,7 @@ import multiprocessing
 from multiprocessing import Pool
 from itertools import accumulate
 from main import set_seed
+from nnue import NNUE
 
 
 class ChessState:
@@ -119,7 +120,7 @@ class UCTNode:
         child_q = self.child_total_value / (1.0 + self.child_number_visits)
         if self.state.board.turn == chess.BLACK:
             child_q = 1.0 - child_q
-        child_u = 0.05 * torch.sqrt(2 * log_visits / (1 + self.child_number_visits))
+        child_u = 0.04 * torch.sqrt(2 * log_visits / (1 + self.child_number_visits))
         # child_u = 0.05 * log_visits / (1 + self.child_number_visits)
         best_move_idx = torch.argmax(child_q + child_u).item()
 
@@ -211,16 +212,20 @@ class UCTNode:
 
 class MCTSEngine:
 
-    def __init__(self, root_dir=r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals", device='cuda'):
+    def __init__(self, root_dir=r"C:\Users\Ahmad-personal\PycharmProjects\chess_stackfish_evals", device='cpu', model_type='transformer'):
         self.device = device
-        transformer = ChessTranformer(
-            bin_predictor=BinPredictor(), d_model=256, num_layers=4, nhead=4, dim_feedforward=4 * 256, norm_first=False
-        # bin_predictor = BinPredictor(), d_model = 512, num_layers = 16, nhead = 8, dim_feedforward = 4 * 512
-        ).to(device=device)
-        root_dir = r"/mnt/c/Users/Ahmad-personal/PycharmProjects/chess_stackfish_evals"
+        self.model_type = model_type
+        if model_type == 'transformer':
+            transformer = ChessTranformer(
+                bin_predictor=BinPredictor(), d_model=256, num_layers=4, nhead=4, dim_feedforward=4 * 256, norm_first=False
+            # bin_predictor = BinPredictor(), d_model = 512, num_layers = 16, nhead = 8, dim_feedforward = 4 * 512
+            ).to(device=device)
+        elif model_type == 'nnue':
+            transformer = NNUE(embedding_dim=1024, num_hidden1=8, num_hidden2=32).to(device=device)
+        # root_dir = r"/mnt/c/Users/Ahmad-personal/PycharmProjects/chess_stackfish_evals"
         checkpoint_path = glob.glob(os.path.join(root_dir, "checkpoint_*.pth"))[0]
         checkpoint = torch.load(checkpoint_path)
-        transformer.load_state_dict(checkpoint['transformer_state_dict'])
+        transformer.load_state_dict(checkpoint[f'{model_type}_state_dict'])
         transformer.eval()
         # transformer.transformer = torch.compile(transformer.transformer)
         self.transformer = transformer
@@ -232,7 +237,7 @@ class MCTSEngine:
     def get_evals_for_all_moves(self, nodes: List[UCTNode]):
         self.calls_to_eval += 1
         if len(nodes) == 0:
-            return [], []
+            return []
         node_separations = list(accumulate([len(node.legal_moves) for node in nodes]))[:-1]
 
         def _get_fens_and_draw_indices(node):
@@ -257,18 +262,18 @@ class MCTSEngine:
     def _compute_evals_from_fens(self, fens, node_separations, draw_indices):
         with autocast():
             with torch.no_grad():
-                # white_evals = transformer.compute_white_win_prob_from_fen(fens, device=device)
-                # white_evals = self.transformer.compute_avg_bin_index_from_fens(fens, device=self.device)
-                white_evals, white_eval_stds = self.transformer.compute_bin_index_means_and_stds_from_fens(
-                    fens, device=self.device)
-                white_evals = white_evals / (self.transformer.bin_predictor.total_num_bins - 1.0)
-                white_eval_stds = white_eval_stds / (self.transformer.bin_predictor.total_num_bins - 1.0)
+                white_evals = self.transformer.compute_white_win_prob_from_fen(fens, device=self.device)
+
+                # white_evals, white_eval_stds = self.transformer.compute_bin_index_means_and_stds_from_fens(
+                #     fens, device=self.device)
+                # white_evals = white_evals / (self.transformer.bin_predictor.total_num_bins - 1.0)
+
                 for idx in draw_indices:
                     white_evals[idx] = 0.5
-                    white_eval_stds[idx] = 0.0
+                    # white_eval_stds[idx] = 0.0
                 white_win_probs_split = torch.tensor_split(white_evals, node_separations)
-                white_eval_stds_split = torch.tensor_split(white_eval_stds, node_separations)
-        return white_win_probs_split, white_eval_stds_split
+                # white_eval_stds_split = torch.tensor_split(white_eval_stds, node_separations)
+        return white_win_probs_split
 
     def mcts(self, root: UCTNode, node_batch_size, time_limit=2.0, verbose=True) -> None:
         start_time = time.time()
@@ -287,7 +292,7 @@ class MCTSEngine:
             terminal_nodes = list(node for node in nodes_set if node.is_terminal())
             non_terminal_nodes = list(node for node in nodes_set if not node.is_terminal())
             # print(get_evals_for_all_moves(non_terminal_nodes))
-            for j, (evals, eval_stds) in enumerate(zip(*self.get_evals_for_all_moves(non_terminal_nodes))):
+            for j, evals in enumerate(self.get_evals_for_all_moves(non_terminal_nodes)):
                 node = non_terminal_nodes[j]
                 # evals = evals.cpu()
                 node.expand(evals)
@@ -342,7 +347,7 @@ def run():
     # print(torch._dynamo.list_backends())
 
     set_seed(42)
-    engine = MCTSEngine()
+    engine = MCTSEngine(model_type='nnue')
     board = chess.Board()
     state = ChessState(board)
     evals = [0.5]

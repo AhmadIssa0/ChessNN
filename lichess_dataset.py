@@ -335,11 +335,26 @@ class NNUEIO:
     expanded_fens: List[str]
     side_to_move: torch.Tensor  # 1 for white, 0 for black
     white_win_prob: torch.Tensor = field(init=False)  # (B)
+    white_win_prob_with_mates: torch.Tensor = field(init=False)  # (B)
 
     def __post_init__(self):
         # For conversion of centipawns to win percentage see https://lichess.org/page/accuracy
         # Win% = 50 + 50 * (2 / (1 + exp(-0.00368208 * centipawns)) - 1)
         self.white_win_prob = 1.0 / (1.0 + torch.exp(-0.00368208 * self.cp_evals))
+
+        mates = self.mates.clone()
+        mates[mates == 0] = torch.inf
+        mate_sgn = 2 * (mates > 0).float() - 1
+        mate_prob = (4 / (mates + 3 * mate_sgn) + 1) * 0.5
+        # print('Mates:')
+        # print(mates)
+        # print('Mate prob:')
+        # print(mate_prob)
+        # print('Paired:')
+        # print(list(zip(mates.tolist(), mate_prob.tolist())))
+        # exit(0)
+
+        self.white_win_prob_with_mates = 0.8 * self.white_win_prob + 0.2 * mate_prob
 
     def to(self, device):
         return NNUEIO(
@@ -373,7 +388,7 @@ def nnue_collate_fn(batch: List[RawIO]):
             side_to_move.append(0)
 
     eval_batch = torch.tensor([x.cp_eval for x in batch], dtype=torch.long)
-    mates = torch.tensor([x.mate for x in batch], dtype=torch.bool)
+    mates = torch.tensor([x.mate for x in batch], dtype=torch.float32)
     return NNUEIO(
         halfkp_indices=torch.stack(half_kps),
         cp_evals=eval_batch,
